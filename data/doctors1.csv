@@ -1,0 +1,13 @@
+id,name,role,ward,clinic,icu,night_allowed,needs_mentor,max_hours,opt_out,skills,twentyfour_allowed
+1,Dr Kowalski,specialist,1,1,0,1,0,48,0,ward;clinic_general;clinic_device;clinic_htn,1
+2,Dr Nowak,specialist,1,1,1,1,0,48,0,ward;clinic_general;icu,1
+3,Dr Zieliński,specialist,1,1,0,1,0,60,1,ward;clinic_general;clinic_arrhythmia;clinic_device,1
+4,Dr Majchrzak,icu_specialist,1,0,1,1,0,65,1,ward;icu,1
+5,Dr Wiśniewski,icu_specialist,1,0,1,1,0,60,1,ward;icu,1
+6,Dr Lewandowski,resident,1,1,0,1,1,48,0,ward;clinic_general,0
+7,Dr Krawczyk,icu_specialist,1,1,0,1,1,48,0,ward;clinic_general;icu,1
+8,Dr Król,resident,1,1,0,0,1,48,0,ward;clinic_general,0
+9,Dr Dąbrowska,specialist,1,0,0,0,1,48,0,ward;clinic_general,0
+10,Dr Pawłowska,outpatient,0,1,0,0,0,32,0,clinic_general;clinic_device;clinic_htn,0
+11,Dr Lipski,specialist,1,1,0,1,0,60,0,ward;clinic_general;icu,1
+12,Dr Lipski2,specialist,1,1,0,1,0,60,0,ward;clinic_general;icu,1
