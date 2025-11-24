@@ -23,6 +23,8 @@ doctor_id,code,preference
 8,WARD_24_SUN,dislike
 8,WARD_M_MON,dislike
 8,WARD_E_FRI,dislike
+9,CL_DEV_MON,like
+9,CL_DEV_THU,like
 10,ICU_24_SUN,dislike
 10,WARD_24_SUN,dislike
 11,ICU_24_SUN,dislike

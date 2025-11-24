@@ -5,6 +5,72 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
+# === HELPERS =====================================================
+
+def build_doctor_stats(
+    D, S, id_to_name, id_to_role, x, hours,
+    night_shifts, twentyfour_shifts, shifts, shift_idx, max_hours, solver
+):
+    """Buduje DataFrame ze statystykami dla każdego lekarza"""
+    rows = []
+    for d in D:
+        rows.append({
+            "Doctor": id_to_name[d],
+            "Role": id_to_role[d],
+            "TotalHours": sum(solver.Value(x[(d, s)]) * hours[s] for s in S),
+            "MaxHours": max_hours[d],
+            "NightShifts": sum(solver.Value(x[(d, s)]) for s in night_shifts),
+            "TwentyFourCount": sum(solver.Value(x[(d, s)]) for s in twentyfour_shifts),
+            "WardCount": sum(
+                solver.Value(x[(d, s)])
+                for s in S if shifts.loc[shift_idx[s], "dept"] == "WARD"
+            ),
+            "ICUCount": sum(
+                solver.Value(x[(d, s)])
+                for s in S if shifts.loc[shift_idx[s], "dept"] == "ICU"
+            ),
+            "ClinicCount": sum(
+                solver.Value(x[(d, s)])
+                for s in S if shifts.loc[shift_idx[s], "dept"] == "CLINIC"
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def add_preference_stats(stats_df, pref, x, solver, id_to_name, code_to_id):
+    """Dodaje do stats_df kolumny like_satisfied / dislike_violated dla każdego lekarza"""
+    stats_df["like_satisfied"] = 0
+    stats_df["dislike_violated"] = 0
+
+    for _, row in pref.iterrows():
+        d = row["doctor_id"]
+        s = code_to_id[row["code"]]
+        pref_type = row["preference"]
+
+        if solver.Value(x[(d, s)]) == 1:
+            col = "like_satisfied" if pref_type == "like" else "dislike_violated"
+            stats_df.loc[stats_df["Doctor"] == id_to_name[d], col] += 1
+
+    return stats_df
+
+
+def build_solver_stats(solver, max_nights, min_nights, spread, status):
+    """Zwraca DataFrame z globalnymi statystykami"""
+    solver_stats = {
+        "objective_value": solver.ObjectiveValue()
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None,
+        "status": solver.StatusName(status),
+        "conflicts": solver.NumConflicts(),
+        "branches": solver.NumBranches(),
+        "wall_time": solver.WallTime(),
+        "max_nights": solver.Value(max_nights),
+        "min_nights": solver.Value(min_nights),
+        "spread": solver.Value(spread),
+    }
+    return pd.DataFrame([solver_stats])
+
+
+# === MAIN FUNCTION ===
 def run_model_and_get_results():
     doctors = pd.read_csv(DATA_DIR / "doctors2.csv")
     shifts = pd.read_csv(DATA_DIR / "shifts.csv")
@@ -183,6 +249,15 @@ def run_model_and_get_results():
     """ SOFT CONSTRAINTS """
     pref_terms = []
 
+    # === WORKLOAD PER DOCTOR (HOURS) ===
+    worked_hours = {}
+    for d in D:
+        # od 0 do limitu godzin danego lekarza
+        h_var = model.NewIntVar(0, max_hours[d], f"worked_hours_{d}")
+        model.Add(h_var == sum(x[(d, s)] * hours[s] for s in S))
+        worked_hours[d] = h_var
+
+
     """1. Preferencje """
     for _, row in pref.iterrows():
         d = row["doctor_id"]
@@ -218,15 +293,35 @@ def run_model_and_get_results():
 
     """b. Zmiany weekendowe - TODO: w perspektywnie miesiąca (na razie patrzymy na pojedynczy tydzień) """
 
+    """3. Jak najbardziej równy procent wypracowanych godzin wzglęem limitu """
+    workload_ratio = {}
+    for d in D:
+        ratio = model.NewIntVar(0, 2000, f"workload_ratio_{d}")
+
+        model.Add(ratio * max_hours[d] <= worked_hours[d] * 1000 + 50)
+        model.Add(ratio * max_hours[d] >= worked_hours[d] * 1000 - 50)
+
+        workload_ratio[d] = ratio
+
+    max_ratio = model.NewIntVar(0, 2000, "max_ratio")
+    min_ratio = model.NewIntVar(0, 2000, "min_ratio")
+
+    model.AddMaxEquality(max_ratio, list(workload_ratio.values()))
+    model.AddMinEquality(min_ratio, list(workload_ratio.values()))
+
+    ratio_spread = model.NewIntVar(0, 2000, "ratio_spread")
+    model.Add(ratio_spread == max_ratio - min_ratio)
 
     """ OBJECTIVE FUNCTION """
     w_pref = 3
-    w_spread = 6
+    w_night = 6
+    w_ratio = 8
 
     objective_terms = []
 
     objective_terms += [w_pref * term for term in pref_terms]
-    objective_terms.append(w_spread * spread)
+    objective_terms.append(w_night * spread)
+    objective_terms.append(w_ratio * ratio_spread)
 
     model.Minimize(sum(objective_terms))
 
@@ -273,14 +368,14 @@ def run_model_and_get_results():
     schedule_df = pd.DataFrame(rows)
 
     """ STATISTICS """
-    stats = {
-        "objective_value": solver.ObjectiveValue() if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None,
-        "status": solver.StatusName(status),
-        "conflicts": solver.NumConflicts(),
-        "branches": solver.NumBranches(),
-        "wall_time": solver.WallTime(),
-    }
-    stats_df = pd.DataFrame([stats])
+    stats_df = build_doctor_stats(
+        D, S, id_to_name, id_to_role, x, hours,
+        night_shifts, twentyfour_shifts, shifts, shift_idx, max_hours, solver
+    )
+
+    stats_df = add_preference_stats(stats_df, pref, x, solver, id_to_name, code_to_id)
+
+    solver_stats_df = build_solver_stats(solver, max_nights, min_nights, spread, status)
 
     """ FUNCTIONS """
     def print_schedule():
@@ -415,54 +510,6 @@ def run_model_and_get_results():
         print(f"Wall time  : {solver.WallTime():.3f} s")
     else:
         print("Brak wykonalnego rozwiązania dla obecnych ograniczeń.")
-
-        # ===== STATISTICS FULL DATAFRAME =====
-    stats_rows = []
-
-    for d in D:
-        stats_rows.append({
-            "Doctor": id_to_name[d],
-            "Role": id_to_role[d],
-            "TotalHours": sum(solver.Value(x[(d, s)]) * hours[s] for s in S),
-            "MaxHours": max_hours[d],
-            "NightShifts": sum(solver.Value(x[(d, s)]) for s in night_shifts),
-            "TwentyFourCount": sum(solver.Value(x[(d, s)]) for s in twentyfour_shifts),
-            "WardCount": sum(solver.Value(x[(d, s)]) for s in S if shifts.loc[shift_idx[s], "dept"] == "WARD"),
-            "ICUCount": sum(solver.Value(x[(d, s)]) for s in S if shifts.loc[shift_idx[s], "dept"] == "ICU"),
-            "ClinicCount": sum(solver.Value(x[(d, s)]) for s in S if shifts.loc[shift_idx[s], "dept"] == "CLINIC"),
-
-        })
-    # === PER-DOCTOR STATISTICS ===
-    stats_df = pd.DataFrame(stats_rows)
-
-    # === Preferencje per lekarz ===
-    stats_df["like_satisfied"] = 0
-    stats_df["dislike_violated"] = 0
-
-    for _, row in pref.iterrows():
-        d = row["doctor_id"]
-        s = code_to_id[row["code"]]
-        pref_type = row["preference"]
-
-        if solver.Value(x[(d, s)]) == 1:
-            if pref_type == "like":
-                stats_df.loc[stats_df["Doctor"] == id_to_name[d], "like_satisfied"] += 1
-            else:
-                stats_df.loc[stats_df["Doctor"] == id_to_name[d], "dislike_violated"] += 1
-
-    # === GLOBAL SOLVER STATISTICS ===
-    solver_stats = {
-        "objective_value": solver.ObjectiveValue() if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None,
-        "status": solver.StatusName(status),
-        "conflicts": solver.NumConflicts(),
-        "branches": solver.NumBranches(),
-        "wall_time": solver.WallTime(),
-        "max_nights": solver.Value(max_nights),
-        "min_nights": solver.Value(min_nights),
-        "spread": solver.Value(spread),
-    }
-
-    solver_stats_df = pd.DataFrame([solver_stats])
 
     return status, schedule_df, stats_df, solver_stats_df
 
