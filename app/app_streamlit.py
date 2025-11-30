@@ -13,7 +13,16 @@ from model.cp_sat_model import run_model_and_get_results
 
 st.title("HARMONOGRAM DYŻURÓW")
 
-status, schedule_df, stats_df, solver_stats_df = run_model_and_get_results()
+(
+    status,
+    schedule_df,
+    stats_df,
+    solver_stats_df,
+    doctors,
+    shifts,
+    unavail_day,
+    unavail_shift
+) = run_model_and_get_results()
 
 
 st.write("Status:", status)
@@ -242,7 +251,14 @@ heatmap = (
     .encode(
         y=alt.Y("Doctor:N", sort=None),
         x=alt.X("RiskType:N", title="Typ problemu"),
-        color=alt.value("orange"),
+        color=alt.Color(
+            "RiskType:N",
+            title="Typ problemu",
+            scale=alt.Scale(
+                domain=["OverLimit90", "Many24h", "ManyNights"],
+                range=["green", "purple", "yellow"]
+            ),
+        ),
         tooltip=["Doctor", "RiskType"],
     )
     .properties(height=300)
@@ -262,3 +278,166 @@ st.dataframe(
          "OverLimit90", "Many24h", "ManyNights"]
     ].sort_values(by="TotalHours", ascending=False)
 )
+
+
+st.header("Nieobecności lekarzy")
+
+id_to_name = {row["id"]: row["name"] for _, row in doctors.iterrows()}
+code_to_id = {row["code"]: row["id"] for _, row in shifts.iterrows()}
+
+st.subheader("Grafik nieobecności lekarzy")
+
+# ===== Przygotowanie danych =====
+
+# Mapowanie day → kolejność dni
+day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# 1. Nieobecności całodniowe
+un_day_vis = unavail_day.copy()
+un_day_vis["Type"] = "DAY"
+un_day_vis["Shift"] = un_day_vis["day"]
+un_day_vis["Doctor"] = un_day_vis["doctor_id"].map(id_to_name)
+
+# 2. Nieobecności na konkretne zmiany
+un_shift_vis = unavail_shift.copy()
+un_shift_vis["Type"] = "SHIFT"
+un_shift_vis["Shift"] = un_shift_vis["code"]
+un_shift_vis["Doctor"] = un_shift_vis["doctor_id"].map(id_to_name)
+
+# Połączenie
+un_all = pd.concat([un_day_vis[["Doctor", "Shift", "Type"]],
+                    un_shift_vis[["Doctor", "Shift", "Type"]]],
+                   ignore_index=True)
+
+heatmap_un = (
+    alt.Chart(un_all)
+    .mark_rect()
+    .encode(
+        y=alt.Y("Doctor:N", sort=None, title="Lekarz"),
+        x=alt.X("Shift:N", sort=day_order, title="Dzień / Zmiana"),
+        color=alt.Color("Type:N",
+                        scale=alt.Scale(
+                            domain=["DAY", "SHIFT"],
+                            range=["#E53935", "#FFB300"]
+                        ),
+                        title="Rodzaj nieobecności"),
+        tooltip=["Doctor", "Shift", "Type"]
+    )
+    .properties(height=350)
+)
+
+st.altair_chart(heatmap_un, use_container_width=True)
+
+st.header("Nieobecności — poziom dzienny")
+
+id_to_name = {row["id"]: row["name"] for _, row in doctors.iterrows()}
+
+# Przygotowanie danych dziennych
+days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+day_grid = []
+for _, doc in doctors.iterrows():
+    for day in days:
+        day_grid.append({
+            "Doctor": doc["name"],
+            "DoctorID": doc["id"],
+            "Day": day,
+            "Absent": 0
+        })
+
+day_df = pd.DataFrame(day_grid)
+
+# Nieobecności całodniowe
+for _, row in unavail_day.iterrows():
+    doc = row["doctor_id"]
+    day = row["day"]
+    day_df.loc[(day_df["DoctorID"] == doc) & (day_df["Day"] == day), "Absent"] = 1
+
+# Heatmapa — dni
+days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+heatmap_days = (
+    alt.Chart(day_df)
+    .mark_rect()
+    .encode(
+        y=alt.Y("Doctor:N", title="Lekarz"),
+        x=alt.X("Day:N", title="Dzień tygodnia", sort=days),
+        color=alt.Color(
+            "Absent:N",
+            scale=alt.Scale(
+                domain=[0, 1],
+                range=["#6ABF4B", "#E53935"]  # zielony / czerwony
+            ),
+            title="Status"
+        ),
+        tooltip=["Doctor", "Day", "Absent"]
+    )
+    .properties(height=350)
+)
+
+st.altair_chart(heatmap_days, use_container_width=True)
+
+
+st.header("Nieobecności na poziomie zmian")
+
+id_to_name = {row["id"]: row["name"] for _, row in doctors.iterrows()}
+code_to_shift_id = {row["code"]: row["id"] for _, row in shifts.iterrows()}
+
+shifts_by_day = {day: [] for day in days}
+for _, sh in shifts.iterrows():
+    shifts_by_day[sh["day"]].append(sh)
+
+un_shift = unavail_shift.copy()
+un_shift["ShiftID"] = un_shift["code"].map(code_to_shift_id)
+un_shift["Doctor"] = un_shift["doctor_id"].map(id_to_name)
+
+for day in days:
+    st.subheader(f"{day} — dostępność na zmiany")
+
+    shifts_today = shifts_by_day[day]
+    shift_labels = [f"{sh['code']}" for sh in shifts_today]
+
+    grid = []
+    for _, doc in doctors.iterrows():
+        for sh in shifts_today:
+            grid.append({
+                "Doctor": doc["name"],
+                "DoctorID": doc["id"],
+                "ShiftID": sh["id"],
+                "ShiftLabel": sh["code"],
+                "Status": "Available"
+            })
+
+    df_day = pd.DataFrame(grid)
+
+    day_unavailable_docs = unavail_day[unavail_day["day"] == day]["doctor_id"].tolist()
+    df_day.loc[df_day["DoctorID"].isin(day_unavailable_docs), "Status"] = "DayAbsent"
+
+    for _, row in un_shift[un_shift["ShiftID"].isin(df_day["ShiftID"])].iterrows():
+        df_day.loc[
+            (df_day["DoctorID"] == row["doctor_id"]) &
+            (df_day["ShiftID"] == row["ShiftID"]),
+            "Status"
+        ] = "ShiftAbsent"
+
+    # Heatmapa dla zmian dla każdego dnia
+    heatmap_shifts = (
+        alt.Chart(df_day)
+        .mark_rect()
+        .encode(
+            y=alt.Y("Doctor:N", title="Lekarz"),
+            x=alt.X("ShiftLabel:N", title="Zmiana"),
+            color=alt.Color(
+                "Status:N",
+                scale=alt.Scale(
+                    domain=["Available", "ShiftAbsent", "DayAbsent"],
+                    range=["#6ABF4B", "#E53935", "#FFB300"]
+                ),
+                title="Status"
+            ),
+            tooltip=["Doctor", "ShiftLabel", "Status"]
+        )
+        .properties(height=300)
+    )
+
+    st.altair_chart(heatmap_shifts, use_container_width=True)

@@ -74,7 +74,7 @@ def build_solver_stats(solver, max_nights, min_nights, spread, status):
 def run_model_and_get_results():
     doctors = pd.read_csv(DATA_DIR / "doctors2.csv")
     shifts = pd.read_csv(DATA_DIR / "shifts.csv")
-    unavail_day = pd.read_csv(DATA_DIR / "unavailabilities_day.csv")
+    unavail_day = pd.read_csv(DATA_DIR / "unavailabilities_day_1.csv")
     unavail_shift = pd.read_csv(DATA_DIR / "unavailabilities_shift.csv")
     pref = pd.read_csv(DATA_DIR / "preferences.csv")
 
@@ -114,6 +114,8 @@ def run_model_and_get_results():
 
     specialists = doctors[doctors["role"].isin(["specialist", "icu_specialist"])]["id"]
     needs_mentor = doctors[doctors["needs_mentor"]==1]["id"]
+    opt_out_doctors = doctors[doctors["opt_out"]==1]["id"]
+    regular_doctors = doctors[doctors["opt_out"]==0]["id"]
 
     twentyfour_allowed = {doctor["id"]: doctor["twentyfour_allowed"] for _, doctor in doctors.iterrows()}
     twentyfour_shifts = [s for s in S if shifts.loc[shift_idx[s], "hours"] == 24]
@@ -144,16 +146,7 @@ def run_model_and_get_results():
             if req not in doctor["skill_list"]:
                 model.Add(x[(d,s)] == 0)
 
-    """2. Na każdej zmianie jest co najmniej wymagana liczba lekarzy."""
-    for _, shift in shifts.iterrows():
-        s = shift["id"]
-        min_staff = shift["min_staff"]
-
-        model.Add(
-            sum(x[d, s] for d in D) >= min_staff
-        )
-
-    """3. Maksymalnie 1 zmiana w ciągu doby """
+    """2. Maksymalnie 1 zmiana w ciągu doby """
     for d in D:
         for day in days:
             shifts_per_day = [s for s in S if shift_day[s] == day]
@@ -163,7 +156,7 @@ def run_model_and_get_results():
                 sum(x[(d, s)] for s in day_shifts[day]) <= 1
             )
 
-    """4. Co najmniej 11 godzin nieprzerwanego odpoczynku po zmianie """
+    """3. Co najmniej 11 godzin nieprzerwanego odpoczynku po zmianie """
     for d in D:
         for s1 in S:
             for s2 in S:
@@ -173,21 +166,21 @@ def run_model_and_get_results():
                     model.Add(x[(d, s1)] + x[(d, s2)] <= 1)
 
 
-    """5. Zachowanie limitu tygodniowego godzin pracy (w zależności od lekarza) """
+    """4. Zachowanie limitu tygodniowego godzin pracy (w zależności od lekarza) """
     for _, doctor in doctors.iterrows():
         d = doctor["id"]
         model.Add(
             sum(x[(d, s)] * hours[s] for s in S) <= max_hours[d]
         )
 
-    """6. Opiekun dla stażysty (i niekórych rezydentów) """
+    """5. Opiekun dla stażysty (i niekórych rezydentów) """
     for s in S:
         for d in needs_mentor:
             model.Add(
                 x[(d,s)] <= sum(x[(spec,s)] for spec in specialists)
             )
 
-    """7. Maksymalnie 2 dyżury nocne pod rząd """
+    """6. Maksymalnie 2 dyżury nocne pod rząd """
     for d in D:
         for i in range(len(days)-2):
             window_days = days[i:i+3]
@@ -195,7 +188,7 @@ def run_model_and_get_results():
             if shifts_in_window:
                 model.Add(sum(x[(d, s)] for s in shifts_in_window) <= 2)
 
-    """8. Dzień wolny po zmianie nocnej """
+    """7. Dzień wolny po zmianie nocnej """
     for d in D:
         for i in range(len(days)-1):
             current_day = days[i]
@@ -208,8 +201,7 @@ def run_model_and_get_results():
                     sum(x[(d, s)] for s in current_night_shifts) + sum(x[(d, s)] for s in next_day_shifts) <= 1
                 )
 
-
-    """9. Co najmniej 35 godzin nieprzerwanego odpoczynku w każdym tygodniu """
+    """8. Co najmniej 35 godzin nieprzerwanego odpoczynku w każdym tygodniu """
     for d in D:
         shifts_per_day = {day: [s for s in S if shift_day[s] == day] for day in days}
         works_vars = []
@@ -222,14 +214,14 @@ def run_model_and_get_results():
         model.Add(sum(works_vars) <= 6)
 
 
-    '''10. Nie każdy może mieć 24-godzinny dyżur '''
+    '''9. Nie każdy może mieć 24-godzinny dyżur '''
     for d in D:
         if twentyfour_allowed[d] == 0:
             for s in twentyfour_shifts:
                 model.Add(x[(d,s)] == 0)
 
 
-    '''11. Uwzględnienie niedostępności (np: urlopy) '''
+    '''10. Uwzględnienie niedostępności (np: urlopy) '''
     # Cały dzień
     for _, row in unavail_day.iterrows():
         d = row["doctor_id"]
@@ -245,6 +237,19 @@ def run_model_and_get_results():
         s = code_to_id[code]
         model.Add(x[d,s] == 0)
 
+
+    """ SLACK """
+    """ Na każdej zmianie jest co najmniej wymagana liczba lekarzy - aby uniknąć infeasible """
+    slacks = {}
+
+    for _, shift in shifts.iterrows():
+        s = shift["id"]
+        min_staff = shift["min_staff"]
+
+        slack = model.NewIntVar(0, min_staff, f"slack_{s}")
+        slacks[s] = slack
+
+        model.Add(sum(x[(d, s)] for d in D) + slack >= min_staff)
 
     """ SOFT CONSTRAINTS """
     pref_terms = []
@@ -293,9 +298,9 @@ def run_model_and_get_results():
 
     """b. Zmiany weekendowe - TODO: w perspektywnie miesiąca (na razie patrzymy na pojedynczy tydzień) """
 
-    """3. Jak najbardziej równy procent wypracowanych godzin wzglęem limitu """
+    """3. Jak najbardziej równy procent wypracowanych godzin względem limitu """
     workload_ratio = {}
-    for d in D:
+    for d in opt_out_doctors:
         ratio = model.NewIntVar(0, 2000, f"workload_ratio_{d}")
 
         model.Add(ratio * max_hours[d] <= worked_hours[d] * 1000 + 50)
@@ -305,23 +310,45 @@ def run_model_and_get_results():
 
     max_ratio = model.NewIntVar(0, 2000, "max_ratio")
     min_ratio = model.NewIntVar(0, 2000, "min_ratio")
-
-    model.AddMaxEquality(max_ratio, list(workload_ratio.values()))
-    model.AddMinEquality(min_ratio, list(workload_ratio.values()))
-
     ratio_spread = model.NewIntVar(0, 2000, "ratio_spread")
-    model.Add(ratio_spread == max_ratio - min_ratio)
+
+    if workload_ratio:
+        model.AddMaxEquality(max_ratio, list(workload_ratio.values()))
+        model.AddMinEquality(min_ratio, list(workload_ratio.values()))
+        model.Add(ratio_spread == max_ratio - min_ratio)
+
+    else:
+        model.Add(max_ratio == 0)
+        model.Add(min_ratio == 0)
+        model.Add(ratio_spread == 0)
+
+
+    """4. Przepracowanie wystarczającej liczby godzin przez regularnych lekarzy (można zamienić na hard constraint lub pozostawić takie uproszczenie ze względu na to, iż w szpitalach często zdarzają się nieplanowane nadgodziny - np. w wyniku przedłużenia zabiegu """
+    underwork = {}
+    for d in regular_doctors:
+        uw = model.NewIntVar(0, max_hours[d], f"underwork_{d}")
+        target = int(0.95 * max_hours[d])
+
+        model.Add(uw >= target - worked_hours[d])
+        model.Add(uw >= 0)
+
+        underwork[d] = uw
+
 
     """ OBJECTIVE FUNCTION """
-    w_pref = 3
-    w_night = 6
-    w_ratio = 8
+    W_SLACK = 10000 # w przypadku braku personelu - tylko w najwyższej konieczności
+    w_pref = 2
+    w_night = 1
+    w_ratio = 2
+    w_underwork = 1
 
     objective_terms = []
 
     objective_terms += [w_pref * term for term in pref_terms]
     objective_terms.append(w_night * spread)
     objective_terms.append(w_ratio * ratio_spread)
+    objective_terms.append(w_underwork * sum(underwork[d] for d in regular_doctors))
+    objective_terms.append(W_SLACK * sum(slacks[s] for s in slacks))
 
     model.Minimize(sum(objective_terms))
 
@@ -340,20 +367,23 @@ def run_model_and_get_results():
         for _, sh in shifts_sorted[shifts_sorted["day"] == day].iterrows():
             s_id = sh["id"]
             assigned = [d for d in D if solver.Value(x[(d, s_id)]) == 1]
+            missing = solver.Value(slacks[s_id])  # liczba brakujących lekarzy
 
-            if assigned:
-                for d in assigned:
-                    rows.append({
-                        "Day": day,
-                        "ShiftCode": sh["code"],
-                        "Dept": sh["dept"],
-                        "StartHour": sh["start_hour"],
-                        "EndHour": sh["end_hour"],
-                        "Hours": sh["hours"],
-                        "Doctor": id_to_name[d],
-                        "Role": id_to_role[d],
-                    })
-            else:
+            for d in assigned:
+                rows.append({
+                    "Day": day,
+                    "ShiftCode": sh["code"],
+                    "Dept": sh["dept"],
+                    "StartHour": sh["start_hour"],
+                    "EndHour": sh["end_hour"],
+                    "Hours": sh["hours"],
+                    "Doctor": id_to_name[d],
+                    "Role": id_to_role[d],
+                    "Missing": 0
+                })
+
+            # potem NONE
+            for _ in range(missing):
                 rows.append({
                     "Day": day,
                     "ShiftCode": sh["code"],
@@ -363,8 +393,8 @@ def run_model_and_get_results():
                     "Hours": sh["hours"],
                     "Doctor": None,
                     "Role": None,
+                    "Missing": 1
                 })
-
     schedule_df = pd.DataFrame(rows)
 
     """ STATISTICS """
@@ -411,6 +441,13 @@ def run_model_and_get_results():
                 print(f"{code:15s} [{dept:6s}] {start:02d}:00–{end % 24:02d}:00 ({hours_s}h) -> {assigned_str}")
 
         print("\\n=== RAPORT SZCZEGÓŁOWY ===\\n")
+        print("\n--- BRAKI OBSADY ---")
+        for _, sh in shifts.iterrows():
+            s = sh["id"]
+            miss = solver.Value(slacks[s])
+            if miss > 0:
+                print(f"{sh['code']:15s}  brakuje: {miss}")
+
         # ===== A. LICZBA GODZIN NA OSOBĘ =====
         print("\\n--- A. Liczba godzin pracy na lekarza ---")
         total_hours_worked = {}
@@ -476,7 +513,7 @@ def run_model_and_get_results():
             warnings = []
 
             # blisko limitu godzin
-            if max_hours[d] > 48 and total_hours_worked[d] >= 0.9 * max_hours[d]:
+            if d in opt_out_doctors and max_hours[d] > 48 and total_hours_worked[d] >= 0.9 * max_hours[d]:
                 warnings.append("Blisko limitu godzin")
 
             # dużo zmian 24h
@@ -511,7 +548,17 @@ def run_model_and_get_results():
     else:
         print("Brak wykonalnego rozwiązania dla obecnych ograniczeń.")
 
-    return status, schedule_df, stats_df, solver_stats_df
+    return (
+        status,
+        schedule_df,
+        stats_df,
+        solver_stats_df,
+        doctors,
+        shifts,
+        unavail_day,
+        unavail_shift
+    )
+
 
 if __name__ == "__main__":
     status, schedule_df, stats_df, solver_stats_df = run_model_and_get_results()
