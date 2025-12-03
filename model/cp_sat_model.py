@@ -5,7 +5,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
-# === HELPERS =====================================================
+# === HELPERS ===
 
 def build_doctor_stats(
     D, S, id_to_name, id_to_role, x, hours,
@@ -69,12 +69,15 @@ def build_solver_stats(solver, max_nights, min_nights, spread, status):
     }
     return pd.DataFrame([solver_stats])
 
-
 # === MAIN FUNCTION ===
-def run_model_and_get_results():
-    doctors = pd.read_csv(DATA_DIR / "doctors2.csv")
-    shifts = pd.read_csv(DATA_DIR / "shifts.csv")
-    unavail_day = pd.read_csv(DATA_DIR / "unavailabilities_day_1.csv")
+def run_model_and_get_results(doctors_df=None):
+    if doctors_df is None:
+        doctors = pd.read_csv(DATA_DIR / "doctors2.csv")
+    else:
+        doctors = doctors_df.copy()
+
+    shifts = pd.read_csv(DATA_DIR / "shifts_1.csv")
+    unavail_day = pd.read_csv(DATA_DIR / "unavailabilities_day_2.csv")
     unavail_shift = pd.read_csv(DATA_DIR / "unavailabilities_shift.csv")
     pref = pd.read_csv(DATA_DIR / "preferences.csv")
 
@@ -128,6 +131,19 @@ def run_model_and_get_results():
 
     days_to_shifts = {day: [s for s in S if shift_day[s] == day] for day in days}
     code_to_id = {row["code"]: row["id"] for _, row in shifts.iterrows()}
+
+    full_day_unavail = {
+        d: set(unavail_day[unavail_day["doctor_id"] == d]["day"].tolist()) for d in D
+    }
+    available_days = {d: len([day for day in days if day not in full_day_unavail[d]]) for d in D}
+
+    """ Limit godzin pracy lekarzy z uwzględnieniem urlopów - dla tygodnia """
+    adjusted_max_hours = {}
+    for d in D:
+        if available_days[d] == 0:
+            adjusted_max_hours[d] = 0
+        else:
+            adjusted_max_hours[d] = int(max_hours[d] * available_days[d] / 7)
 
     """ FUNCTIONS """
     def rest_violation(sh1, sh2, min_rest=11) -> bool:
@@ -240,16 +256,24 @@ def run_model_and_get_results():
 
     """ SLACK """
     """ Na każdej zmianie jest co najmniej wymagana liczba lekarzy - aby uniknąć infeasible """
+    """ Dodatkowo niewielka (do uzgodnienia) kara za overstaff - aby nie dodawać nadmiarowo godzin """
     slacks = {}
+    slacks_o = {}
 
     for _, shift in shifts.iterrows():
         s = shift["id"]
         min_staff = shift["min_staff"]
+        regular_staff = shift["regular_staff"]
 
+        # === Understaff ===
         slack = model.NewIntVar(0, min_staff, f"slack_{s}")
         slacks[s] = slack
-
         model.Add(sum(x[(d, s)] for d in D) + slack >= min_staff)
+
+        # === Overstaff ===
+        slack_o = model.NewIntVar(0, regular_staff, f"slack_{s}")
+        slacks_o[s] = slack_o
+        model.Add(sum(x[(d, s)] for d in D) + slack_o <= regular_staff)
 
     """ SOFT CONSTRAINTS """
     pref_terms = []
@@ -258,7 +282,8 @@ def run_model_and_get_results():
     worked_hours = {}
     for d in D:
         # od 0 do limitu godzin danego lekarza
-        h_var = model.NewIntVar(0, max_hours[d], f"worked_hours_{d}")
+        # h_var = model.NewIntVar(0, max_hours[d], f"worked_hours_{d}")
+        h_var = model.NewIntVar(0, adjusted_max_hours[d], f"worked_hours_{d}")
         model.Add(h_var == sum(x[(d, s)] * hours[s] for s in S))
         worked_hours[d] = h_var
 
@@ -303,8 +328,10 @@ def run_model_and_get_results():
     for d in opt_out_doctors:
         ratio = model.NewIntVar(0, 2000, f"workload_ratio_{d}")
 
-        model.Add(ratio * max_hours[d] <= worked_hours[d] * 1000 + 50)
-        model.Add(ratio * max_hours[d] >= worked_hours[d] * 1000 - 50)
+        # model.Add(ratio * max_hours[d] <= worked_hours[d] * 1000 + 50)
+        # model.Add(ratio * max_hours[d] >= worked_hours[d] * 1000 - 50)
+        model.Add(ratio * adjusted_max_hours[d] <= worked_hours[d] * 1000 + 50)
+        model.Add(ratio * adjusted_max_hours[d] >= worked_hours[d] * 1000 - 50)
 
         workload_ratio[d] = ratio
 
@@ -326,8 +353,10 @@ def run_model_and_get_results():
     """4. Przepracowanie wystarczającej liczby godzin przez regularnych lekarzy (można zamienić na hard constraint lub pozostawić takie uproszczenie ze względu na to, iż w szpitalach często zdarzają się nieplanowane nadgodziny - np. w wyniku przedłużenia zabiegu """
     underwork = {}
     for d in regular_doctors:
-        uw = model.NewIntVar(0, max_hours[d], f"underwork_{d}")
-        target = int(0.95 * max_hours[d])
+        # uw = model.NewIntVar(0, max_hours[d], f"underwork_{d}")
+        # target = int(0.95 * max_hours[d])
+        uw = model.NewIntVar(0, adjusted_max_hours[d], f"underwork_{d}")
+        target = int(0.95 * adjusted_max_hours[d])
 
         model.Add(uw >= target - worked_hours[d])
         model.Add(uw >= 0)
@@ -337,6 +366,7 @@ def run_model_and_get_results():
 
     """ OBJECTIVE FUNCTION """
     W_SLACK = 10000 # w przypadku braku personelu - tylko w najwyższej konieczności
+    w_overstaff = 1
     w_pref = 2
     w_night = 1
     w_ratio = 2
@@ -349,6 +379,7 @@ def run_model_and_get_results():
     objective_terms.append(w_ratio * ratio_spread)
     objective_terms.append(w_underwork * sum(underwork[d] for d in regular_doctors))
     objective_terms.append(W_SLACK * sum(slacks[s] for s in slacks))
+    objective_terms.append(w_overstaff * sum(slacks_o[s] for s in slacks_o))
 
     model.Minimize(sum(objective_terms))
 
@@ -398,9 +429,13 @@ def run_model_and_get_results():
     schedule_df = pd.DataFrame(rows)
 
     """ STATISTICS """
+    # stats_df = build_doctor_stats(
+    #     D, S, id_to_name, id_to_role, x, hours,
+    #     night_shifts, twentyfour_shifts, shifts, shift_idx, max_hours, solver
+    # )
     stats_df = build_doctor_stats(
         D, S, id_to_name, id_to_role, x, hours,
-        night_shifts, twentyfour_shifts, shifts, shift_idx, max_hours, solver
+        night_shifts, twentyfour_shifts, shifts, shift_idx, adjusted_max_hours, solver
     )
 
     stats_df = add_preference_stats(stats_df, pref, x, solver, id_to_name, code_to_id)
@@ -556,11 +591,181 @@ def run_model_and_get_results():
         doctors,
         shifts,
         unavail_day,
-        unavail_shift
+        unavail_shift,
+        slacks,
+        solver,
+        shift_idx
     )
+
+""" ADDITIONAL DOCTOR """
+# === Tworzenie nowego "idealnego" lekarza ===
+def generate_best_new_doctor(slacks, shifts, shift_idx, solver, index):
+    """Tworzy jednego lekarza pokrywającego wszystkie istniejące braki"""
+
+    missing_skills = []
+    needs_24 = False
+
+    for s, sl in slacks.items():
+        miss = solver.Value(sl)
+        if miss > 0:
+            skill = shifts.loc[shift_idx[s], "required_skill"]
+            missing_skills.append(skill)
+            if shifts.loc[shift_idx[s], "hours"] == 24:
+                needs_24 = True
+
+    if not missing_skills:
+        return None
+
+    unique = sorted(set(missing_skills))
+    skill_string = ";".join(unique)
+
+    role = "icu_specialist" if any("icu" in sk.lower() for sk in unique) else "specialist"
+
+    return {
+        "id": 9000 + index,
+        "name": f"DODATKOWY_LEKARZ_{index}",
+        "role": role,
+        "skills": skill_string,
+        "needs_mentor": 0,
+        "opt_out": 1,
+        "max_hours": 72,
+        "twentyfour_allowed": 1 if needs_24 else 0,
+    }
+
+def compute_sum_slack(slacks, solver):
+    return sum(solver.Value(sl) for sl in slacks.values())
+
+def run_model_with_candidate(base_doctors_df, candidate_dict, shifts, unavail_day, unavail_shift):
+    doctors_extended = pd.concat([base_doctors_df, pd.DataFrame([candidate_dict])], ignore_index=True)
+    doctors_extended["skill_list"] = doctors_extended["skills"].apply(lambda x: x.split(";") if isinstance(x, str) else [])
+
+    (
+        status,
+        schedule_df,
+        stats_df,
+        solver_stats_df,
+        _,
+        _,
+        _,
+        _,
+        slacks,
+        solver,
+        _
+    ) = run_model_and_get_results(doctors_df=doctors_extended)
+
+    return compute_sum_slack(slacks, solver)
+
+# === Wybór lekarza z dostępnych ===
+def choose_best_candidate(candidates_df, slack_sum_before, base_doctors_df,
+                          shifts, unavail_day, unavail_shift):
+
+    # wyniki w formie (kandydat,poprawa,koszt)
+    results = []
+
+    for _, row in candidates_df.iterrows():
+        candidate = row.to_dict()
+        slack_after = run_model_with_candidate(base_doctors_df, candidate, shifts, unavail_day, unavail_shift)
+
+        improvement = slack_sum_before - slack_after
+
+        if improvement > 0:
+            results.append((candidate, improvement, candidate["salary"]))
+
+        if not results:
+            return None
+
+        # Sortowanie
+        # 1) Najlepsza poprawa
+        # 2) Najniższa stawka godzinowa
+
+        results.sort(key=lambda x: (-x[1], x[2]))
+
+        # Najlepszy kandydat - dict
+        return results[0][0]
+
+
+# === GŁÓWNA FUNKCJA PO UWZGLĘDNIENIU DODAWANIA LEKARZA W PRZYPADKU BRAKÓW ===
+def run_with_one_extra_doctor():
+    print("\n=== PIERWSZA ITERACJA (SPRAWDZENIE CZY DA SIĘ UTWORZYĆ HARMONOGRAM BEZ BRAKÓW) ===")
+
+    (
+        status,
+        schedule_before,
+        stats_before,
+        solver_stats_before,
+        doctors,
+        shifts,
+        unavail_day,
+        unavail_shift,
+        slacks,
+        solver,
+        shift_idx
+    ) = run_model_and_get_results()
+
+    # Obliczneie ile zmian pozostało nieobsadzonych
+    total_missing = sum(solver.Value(sl) for sl in slacks.values())
+
+    # Jeśli da się obsadzić wszystkie zmiany aktualnymi lekarzami - koniec
+    if total_missing == 0:
+        print("Aktualny personel jest wystarczający")
+        return {
+            "added": False,
+            "status": status,
+            "schedule_before": schedule_before,
+            "stats_before": stats_before,
+            "solver_stats_before": solver_stats_before
+        }
+
+    # Jeśli nie da się obsadzić zmian dostępnymi lekarzami, szukamy dodatkowego, najbardziej optymalnego kandydata
+
+    # Wersja z generowaniem lekarza
+    # new_doc = generate_best_new_doctor(slacks, shifts, shift_idx, solver, index=0)
+    # print("Dodany lekarz:", new_doc)
+
+    candidates_df = pd.read_csv(DATA_DIR / "doctors_to_hire.csv")
+    slack_sum_before = compute_sum_slack(slacks, solver)
+    best_candidate = choose_best_candidate(
+        candidates_df=candidates_df,
+        slack_sum_before=slack_sum_before,
+        base_doctors_df=doctors,
+        shifts=shifts,
+        unavail_day=unavail_day,
+        unavail_shift=unavail_shift,
+    )
+    if best_candidate is None:
+        print("Brak kandydata spełniającego wszytskie wymagania - dodajemy hipotetycznego lekarza")
+        new_doc = generate_best_new_doctor(slacks, shifts, shift_idx, solver, index=0)
+    else:
+        new_doc = best_candidate
+        print("Znaleziono najlepszego kandydata: ", best_candidate)
+
+    doctors_ext = pd.concat([doctors, pd.DataFrame([new_doc])], ignore_index=True)
+    doctors_ext["skill_list"] = doctors_ext["skills"].apply(
+        lambda sk: sk.split(";") if isinstance(sk, str) else []
+    )
+
+    (
+        status_after,
+        schedule_after,
+        stats_after,
+        solver_stats_after,
+        *_,
+    ) = run_model_and_get_results(doctors_df=doctors_ext)
+
+    return {
+        "added": True,
+        "new_doctor": new_doc,
+        "status": status_after,
+        "schedule_before": schedule_before,
+        "schedule_after": schedule_after,
+        "stats_before": stats_before,
+        "stats_after": stats_after,
+        "solver_stats_before": solver_stats_before,
+        "solver_stats_after": solver_stats_after
+    }
+
 
 
 if __name__ == "__main__":
-    status, schedule_df, stats_df, solver_stats_df = run_model_and_get_results()
-    print("Status:", status)
+    status, schedule_df, stats_df, solver_stats_df = run_with_one_extra_doctor()
     schedule_df.to_csv("schedule_output.csv", index=False, encoding="utf-8")
