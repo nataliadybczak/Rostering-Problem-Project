@@ -77,7 +77,7 @@ def run_model_and_get_results(doctors_df=None):
         doctors = doctors_df.copy()
 
     shifts = pd.read_csv(DATA_DIR / "shifts_1.csv")
-    unavail_day = pd.read_csv(DATA_DIR / "unavailabilities_day_2.csv")
+    unavail_day = pd.read_csv(DATA_DIR / "unavailabilities_day_3.csv")
     unavail_shift = pd.read_csv(DATA_DIR / "unavailabilities_shift.csv")
     pref = pd.read_csv(DATA_DIR / "preferences.csv")
 
@@ -671,17 +671,17 @@ def choose_best_candidate(candidates_df, slack_sum_before, base_doctors_df,
         if improvement > 0:
             results.append((candidate, improvement, candidate["salary"]))
 
-        if not results:
-            return None
+    if not results:
+        return None
 
-        # Sortowanie
-        # 1) Najlepsza poprawa
-        # 2) Najniższa stawka godzinowa
+    # Sortowanie
+    # 1) Najlepsza poprawa
+    # 2) Najniższa stawka godzinowa
 
-        results.sort(key=lambda x: (-x[1], x[2]))
+    results.sort(key=lambda x: (-x[1], x[2]))
 
-        # Najlepszy kandydat - dict
-        return results[0][0]
+    # Najlepszy kandydat - dict
+    return results[0][0]
 
 
 # === GŁÓWNA FUNKCJA PO UWZGLĘDNIENIU DODAWANIA LEKARZA W PRZYPADKU BRAKÓW ===
